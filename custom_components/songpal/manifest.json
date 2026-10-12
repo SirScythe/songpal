@@ -1,23 +1,15 @@
 {
   "domain": "songpal",
   "name": "Sony Songpal",
-  "after_dependencies": [
-    "ssdp"
-  ],
-  "codeowners": [
-    "@rytilahti",
-    "@shenxn"
-  ],
+  "after_dependencies": ["ssdp"],
+  "codeowners": ["@SirScythe"],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/songpal",
+  "documentation": "https://github.com/SirScythe/songpal",
   "integration_type": "device",
   "iot_class": "local_push",
-  "loggers": [
-    "songpal"
-  ],
-  "requirements": [
-    "python-songpal==0.16.2"
-  ],
+  "issue_tracker": "https://github.com/SirScythe/songpal/issues",
+  "loggers": ["songpal"],
+  "requirements": ["python-songpal==0.16.2"],
   "ssdp": [
     {
       "manufacturer": "Sony Corporation",
