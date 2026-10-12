@@ -44,7 +44,10 @@ from homeassistant.helpers.entity_platform import (
     AddEntitiesCallback,
 )
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
-from homeassistant.helpers.service_info.ssdp import ATTR_UPNP_UDN
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_FRIENDLY_NAME,
+    ATTR_UPNP_UDN,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util.hass_dict import HassKey
 
@@ -163,6 +166,7 @@ class SongpalEntity(MediaPlayerEntity):
         self._group_control: GroupControl | None = None
         self._group_state: GroupState | None = None
         self._udn: str | None = None
+        self._friendly_name: str = name
         self._group_settling = False
         self._cancel_group_refresh: CALLBACK_TYPE | None = None
 
@@ -545,6 +549,7 @@ class SongpalEntity(MediaPlayerEntity):
         udn = info.upnp[ATTR_UPNP_UDN]
         self._group_control = group_control
         self._udn = udn
+        self._friendly_name = info.upnp.get(ATTR_UPNP_FRIENDLY_NAME) or self._name
         self._attr_supported_features |= MediaPlayerEntityFeature.GROUPING
 
         entities = self.hass.data.setdefault(GROUP_ENTITIES, {})
@@ -571,8 +576,10 @@ class SongpalEntity(MediaPlayerEntity):
         try:
             group_state = await self._group_control.state()
         except UpnpError as ex:
+            # The group service sometimes stops responding for about a minute,
+            # keep the last known state instead of showing the device ungrouped
             _LOGGER.debug("Unable to get the group state: %s", ex)
-            group_state = None
+            return
 
         def _group_key(state: GroupState | None) -> tuple[str, str, str] | None:
             if state is None:
@@ -647,6 +654,25 @@ class SongpalEntity(MediaPlayerEntity):
                 return leader._leader_group_members()  # noqa: SLF001
         return [self.entity_id]
 
+    def _group_name(self, slaves: Iterable[str]) -> str:
+        """Return a group name listing the leader and its members."""
+        entities = self.hass.data[GROUP_ENTITIES]
+        names = [self._friendly_name]
+        names.extend(
+            member._friendly_name  # noqa: SLF001
+            for udn in slaves
+            if (member := entities.get(udn)) is not None
+        )
+        return " + ".join(names)
+
+    async def _async_rename_group(self, slaves: list[str]) -> None:
+        """Rename the group led by this device after its members changed."""
+        try:
+            await self._get_group_control().set_group_name(self._group_name(slaves))
+        except UpnpError as ex:
+            # The members changed already, a stale name is no reason to fail
+            _LOGGER.warning("Unable to rename the group of %s: %s", self.entity_id, ex)
+
     @override
     async def async_join_players(self, group_members: list[str]) -> None:
         """Join group_members as a player group with this device as leader."""
@@ -683,9 +709,10 @@ class SongpalEntity(MediaPlayerEntity):
                 slaves = _slaves(state)
                 if new_udns := [udn for udn in udns if udn not in slaves]:
                     await group_control.add(",".join(new_udns))
-                slaves += new_udns
+                    slaves += new_udns
+                    await self._async_rename_group(slaves)
             else:
-                await group_control.create(self._name, udns)
+                await group_control.create(self._group_name(udns), udns)
                 slaves = udns
         except UpnpError as ex:
             raise HomeAssistantError(
@@ -744,6 +771,8 @@ class SongpalEntity(MediaPlayerEntity):
                 for udn in _slaves(leader._group_state)  # noqa: SLF001
                 if udn != self._udn
             ]
+            if remaining:
+                await leader._async_rename_group(remaining)  # noqa: SLF001
             expected[leader] = _with_group(
                 leader._group_state,  # noqa: SLF001
                 GROUP_MODE_GROUP if remaining else GROUP_MODE_IDLE,
