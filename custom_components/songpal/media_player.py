@@ -2,12 +2,14 @@
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Iterable
 from datetime import timedelta
 import logging
 from typing import Any, override
 from urllib.parse import urlparse
 
 from async_upnp_client.exceptions import UpnpError
+import attr
 from songpal import (
     ConnectChange,
     ContentChange,
@@ -57,11 +59,29 @@ INITIAL_RETRY_DELAY = 10
 
 # The group service is UPnP based and does not push notifications, so poll it.
 GROUP_SCAN_INTERVAL = timedelta(seconds=30)
-# Devices take a few seconds to settle after a group change.
-GROUP_SETTLE_DELAY = 6
+# Devices take about a second to report a group change.
+GROUP_SETTLE_DELAY = 2
 GROUP_MODE_GROUP = "GROUP"
+GROUP_MODE_IDLE = "IDLE"
 
 GROUP_ENTITIES: HassKey[dict[str, SongpalEntity]] = HassKey(f"{DOMAIN}_group_entities")
+
+
+def _slaves(state: GroupState) -> list[str]:
+    """Return the UDNs of the group members listed in a leader's state."""
+    return [udn.strip() for udn in state.SlaveList.split(",") if udn.strip()]
+
+
+def _with_group(
+    state: GroupState,
+    mode: str = GROUP_MODE_IDLE,
+    master: str | None = "",
+    slaves: Iterable[str] = (),
+) -> GroupState:
+    """Return the state with its group replaced, ungrouped by default."""
+    return attr.evolve(
+        state, GroupMode=mode, MasterUUID=master or "", SlaveList=",".join(slaves)
+    )
 
 
 async def async_setup_platform(
@@ -143,6 +163,7 @@ class SongpalEntity(MediaPlayerEntity):
         self._group_control: GroupControl | None = None
         self._group_state: GroupState | None = None
         self._udn: str | None = None
+        self._group_settling = False
         self._cancel_group_refresh: CALLBACK_TYPE | None = None
 
     @override
@@ -152,7 +173,7 @@ class SongpalEntity(MediaPlayerEntity):
         await self._async_update_group_state()
         self.async_on_remove(
             async_track_time_interval(
-                self.hass, self._async_update_group_state, GROUP_SCAN_INTERVAL
+                self.hass, self._async_poll_group_state, GROUP_SCAN_INTERVAL
             )
         )
         self.async_on_remove(self._async_cancel_group_refresh)
@@ -528,9 +549,19 @@ class SongpalEntity(MediaPlayerEntity):
 
         entities = self.hass.data.setdefault(GROUP_ENTITIES, {})
         entities[udn] = self
-        self.async_on_remove(lambda: entities.pop(udn, None))
 
-    async def _async_update_group_state(self, _now: Any = None) -> None:
+        @callback
+        def _unregister() -> None:
+            entities.pop(udn, None)
+
+        self.async_on_remove(_unregister)
+
+    async def _async_poll_group_state(self, _now: Any) -> None:
+        """Poll the group state, unless a group change is still settling."""
+        if not self._group_settling:
+            await self._async_update_group_state()
+
+    async def _async_update_group_state(self) -> None:
         """Fetch the group state and update the entities whose groups changed."""
         if self._group_control is None:
             await self._async_setup_group_control()
@@ -558,17 +589,25 @@ class SongpalEntity(MediaPlayerEntity):
     async def _async_update_all_group_states(self, _now: Any = None) -> None:
         """Fetch the group state of all devices."""
         self._cancel_group_refresh = None
+        entities = list(self.hass.data[GROUP_ENTITIES].values())
+        for entity in entities:
+            entity._group_settling = False  # noqa: SLF001
         await asyncio.gather(
-            *(
-                entity._async_update_group_state()  # noqa: SLF001
-                for entity in list(self.hass.data[GROUP_ENTITIES].values())
-            )
+            *(entity._async_update_group_state() for entity in entities)  # noqa: SLF001
         )
 
-    async def _async_refresh_groups(self) -> None:
-        """Refresh the group states now and again once the devices have settled."""
+    @callback
+    def _async_set_expected_group_states(
+        self, expected: dict[SongpalEntity, GroupState]
+    ) -> None:
+        """Show the expected group states and verify them once the devices settled."""
+        for entity, state in expected.items():
+            entity._group_state = state  # noqa: SLF001
+            entity._group_settling = True  # noqa: SLF001
+        for entity in self.hass.data[GROUP_ENTITIES].values():
+            entity.async_write_ha_state()
+
         self._async_cancel_group_refresh()
-        await self._async_update_all_group_states()
         self._cancel_group_refresh = async_call_later(
             self.hass, GROUP_SETTLE_DELAY, self._async_update_all_group_states
         )
@@ -587,8 +626,8 @@ class SongpalEntity(MediaPlayerEntity):
         members = [self.entity_id]
         members.extend(
             member.entity_id
-            for udn in self._group_state.SlaveList.split(",")
-            if (member := entities.get(udn.strip())) is not None
+            for udn in _slaves(self._group_state)
+            if (member := entities.get(udn)) is not None
         )
         return members
 
@@ -616,7 +655,8 @@ class SongpalEntity(MediaPlayerEntity):
             entity.entity_id: entity
             for entity in self.hass.data[GROUP_ENTITIES].values()
         }
-        udns = []
+        members: list[SongpalEntity] = []
+        udns: list[str] = []
         for entity_id in group_members:
             if entity_id == self.entity_id:
                 continue
@@ -626,6 +666,7 @@ class SongpalEntity(MediaPlayerEntity):
                     translation_key="group_member_not_supported",
                     translation_placeholders={"entity_id": entity_id},
                 )
+            members.append(member)
             udns.append(member.udn)
         if not udns:
             return
@@ -639,11 +680,13 @@ class SongpalEntity(MediaPlayerEntity):
                     translation_placeholders={"entity_id": self.entity_id},
                 )
             if state.GroupMode == GROUP_MODE_GROUP:
-                current = state.SlaveList.split(",")
-                if new_udns := [udn for udn in udns if udn not in current]:
+                slaves = _slaves(state)
+                if new_udns := [udn for udn in udns if udn not in slaves]:
                     await group_control.add(",".join(new_udns))
+                slaves += new_udns
             else:
                 await group_control.create(self._name, udns)
+                slaves = udns
         except UpnpError as ex:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -654,16 +697,26 @@ class SongpalEntity(MediaPlayerEntity):
                 },
             ) from ex
 
-        await self._async_refresh_groups()
+        expected = {self: _with_group(state, GROUP_MODE_GROUP, slaves=slaves)}
+        for member in members:
+            if member._group_state is not None:  # noqa: SLF001
+                expected[member] = _with_group(
+                    member._group_state,  # noqa: SLF001
+                    GROUP_MODE_GROUP,
+                    master=self._udn,
+                )
+        self._async_set_expected_group_states(expected)
 
     @override
     async def async_unjoin_player(self) -> None:
         """Remove this device from its group, dissolving it if it is the leader."""
         group_control = self._get_group_control()
+        entities = self.hass.data[GROUP_ENTITIES]
+        leader = None
         try:
             state = await group_control.state()
             if state.MasterUUID:
-                leader = self.hass.data[GROUP_ENTITIES].get(state.MasterUUID)
+                leader = entities.get(state.MasterUUID)
                 if leader is not None:
                     # Leaving from the member side keeps it listed on the leader
                     await leader._get_group_control().remove(self._udn)  # noqa: SLF001
@@ -671,6 +724,8 @@ class SongpalEntity(MediaPlayerEntity):
                     await group_control.call("X_Exit", SlaveSessionID=state.SessionID)
             elif state.GroupMode == GROUP_MODE_GROUP:
                 await group_control.abort()
+            else:
+                return
         except UpnpError as ex:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -681,4 +736,22 @@ class SongpalEntity(MediaPlayerEntity):
                 },
             ) from ex
 
-        await self._async_refresh_groups()
+        expected = {self: _with_group(state)}
+        if leader is not None and leader._group_state is not None:  # noqa: SLF001
+            # The leader dissolves the group when its last member leaves
+            remaining = [
+                udn
+                for udn in _slaves(leader._group_state)  # noqa: SLF001
+                if udn != self._udn
+            ]
+            expected[leader] = _with_group(
+                leader._group_state,  # noqa: SLF001
+                GROUP_MODE_GROUP if remaining else GROUP_MODE_IDLE,
+                slaves=remaining,
+            )
+        elif not state.MasterUUID:
+            for udn in _slaves(state):
+                member = entities.get(udn)
+                if member is not None and member._group_state is not None:  # noqa: SLF001
+                    expected[member] = _with_group(member._group_state)  # noqa: SLF001
+        self._async_set_expected_group_states(expected)
