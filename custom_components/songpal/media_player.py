@@ -172,6 +172,7 @@ class SongpalEntity(MediaPlayerEntity):
         self._udn: str | None = None
         self._friendly_name: str = name
         self._group_settling = False
+        self._group_prune_lock = asyncio.Lock()
         self._cancel_group_refresh: CALLBACK_TYPE | None = None
 
     @override
@@ -256,6 +257,8 @@ class SongpalEntity(MediaPlayerEntity):
             _LOGGER.debug("Power changed: %s", power)
             self._state = power.status
             self.async_write_ha_state()
+            if not power.status:
+                await self._async_prune_own_group()
 
         async def _try_reconnect(connect: ConnectChange):
             _LOGGER.warning(
@@ -266,6 +269,7 @@ class SongpalEntity(MediaPlayerEntity):
             _LOGGER.debug("Disconnected: %s", connect.exception)
             self._attr_available = False
             self.async_write_ha_state()
+            await self._async_prune_own_group()
 
             # Try to reconnect forever, a successful reconnect will initialize
             # the websocket connection again.
@@ -569,6 +573,7 @@ class SongpalEntity(MediaPlayerEntity):
         """Poll the group state, unless a group change is still settling."""
         if not self._group_settling:
             await self._async_update_group_state()
+            await self._async_prune_group()
 
     async def _async_update_group_state(self) -> None:
         """Fetch the group state and update the entities whose groups changed."""
@@ -606,6 +611,8 @@ class SongpalEntity(MediaPlayerEntity):
         await asyncio.gather(
             *(entity._async_update_group_state() for entity in entities)  # noqa: SLF001
         )
+        for entity in entities:
+            await entity._async_prune_group()  # noqa: SLF001
 
     @callback
     def _async_set_expected_group_states(
@@ -657,6 +664,73 @@ class SongpalEntity(MediaPlayerEntity):
             if leader is not None and leader._is_group_leader:  # noqa: SLF001
                 return leader._leader_group_members()  # noqa: SLF001
         return [self.entity_id]
+
+    @property
+    def _is_off(self) -> bool:
+        """Return whether the device is turned off or unavailable."""
+        return not self.available or not self._state
+
+    async def _async_prune_own_group(self) -> None:
+        """Prune the group of this device after it was turned off or disconnected."""
+        state = self._group_state
+        if state is None or state.GroupMode != GROUP_MODE_GROUP:
+            return
+        leader = self if not state.MasterUUID else None
+        if leader is None:
+            leader = self.hass.data[GROUP_ENTITIES].get(state.MasterUUID)
+        if leader is not None:
+            await leader._async_prune_group()  # noqa: SLF001
+
+    async def _async_prune_group(self) -> None:
+        """Remove devices that were turned off or disconnected from this group.
+
+        The leader keeps streaming to members that were turned off, which disturbs
+        the playback on the remaining devices.
+        """
+        async with self._group_prune_lock:
+            # The leader can only change the group while it is reachable
+            if not self._is_group_leader or self._group_settling or not self.available:
+                return
+            assert self._group_state is not None
+            try:
+                if not self._state:
+                    _LOGGER.info(
+                        "Dissolving the group of %s, it was turned off", self.entity_id
+                    )
+                    await self.async_unjoin_player()
+                    return
+                entities = self.hass.data[GROUP_ENTITIES]
+                for udn in _slaves(self._group_state):
+                    member = entities.get(udn)
+                    if member is not None and member._is_off:  # noqa: SLF001
+                        _LOGGER.info(
+                            "Removing %s from its group, it was turned off or disconnected",
+                            member.entity_id,
+                        )
+                        await self._async_remove_member(member)
+            except (UpnpError, HomeAssistantError) as ex:
+                _LOGGER.warning(
+                    "Unable to update the group of %s: %s", self.entity_id, ex
+                )
+
+    async def _async_remove_member(self, member: SongpalEntity) -> None:
+        """Remove a member from the group led by this device."""
+        await self._get_group_control().remove(member.udn)
+
+        expected: dict[SongpalEntity, GroupState] = {}
+        if member._group_state is not None:
+            expected[member] = _with_group(member._group_state)
+        if self._group_state is not None:
+            # The leader dissolves the group when its last member leaves
+            remaining = [udn for udn in _slaves(self._group_state) if udn != member.udn]
+            if remaining:
+                await self._async_rename_group(remaining)
+            expected[self] = _with_group(
+                self._group_state,
+                GROUP_MODE_GROUP if remaining else GROUP_MODE_IDLE,
+                slaves=remaining,
+            )
+        self._async_set_expected_group_states(expected)
 
     def _group_name(self, slaves: Iterable[str]) -> str:
         """Return a group name listing the leader and its members."""
@@ -750,16 +824,14 @@ class SongpalEntity(MediaPlayerEntity):
         """Remove this device from its group, dissolving it if it is the leader."""
         group_control = self._get_group_control()
         entities = self.hass.data[GROUP_ENTITIES]
-        leader = None
         try:
             state = await group_control.state()
+            if state.MasterUUID and (leader := entities.get(state.MasterUUID)):
+                # Leaving from the member side keeps it listed on the leader
+                await leader._async_remove_member(self)  # noqa: SLF001
+                return
             if state.MasterUUID:
-                leader = entities.get(state.MasterUUID)
-                if leader is not None:
-                    # Leaving from the member side keeps it listed on the leader
-                    await leader._get_group_control().remove(self._udn)  # noqa: SLF001
-                else:
-                    await group_control.call("X_Exit", SlaveSessionID=state.SessionID)
+                await group_control.call("X_Exit", SlaveSessionID=state.SessionID)
             elif state.GroupMode == GROUP_MODE_GROUP:
                 await group_control.abort()
             else:
@@ -775,21 +847,7 @@ class SongpalEntity(MediaPlayerEntity):
             ) from ex
 
         expected = {self: _with_group(state)}
-        if leader is not None and leader._group_state is not None:  # noqa: SLF001
-            # The leader dissolves the group when its last member leaves
-            remaining = [
-                udn
-                for udn in _slaves(leader._group_state)  # noqa: SLF001
-                if udn != self._udn
-            ]
-            if remaining:
-                await leader._async_rename_group(remaining)  # noqa: SLF001
-            expected[leader] = _with_group(
-                leader._group_state,  # noqa: SLF001
-                GROUP_MODE_GROUP if remaining else GROUP_MODE_IDLE,
-                slaves=remaining,
-            )
-        elif not state.MasterUUID:
+        if not state.MasterUUID:
             for udn in _slaves(state):
                 member = entities.get(udn)
                 if member is not None and member._group_state is not None:  # noqa: SLF001
