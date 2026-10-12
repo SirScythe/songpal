@@ -66,6 +66,10 @@ GROUP_SCAN_INTERVAL = timedelta(seconds=30)
 GROUP_SETTLE_DELAY = 2
 GROUP_MODE_GROUP = "GROUP"
 GROUP_MODE_IDLE = "IDLE"
+# Devices reject longer group names when creating and truncate them when renaming
+GROUP_NAME_MAX_BYTES = 64
+# Larger groups are named after the leader and the number of other members
+GROUP_NAME_MAX_LISTED = 3
 
 GROUP_ENTITIES: HassKey[dict[str, SongpalEntity]] = HassKey(f"{DOMAIN}_group_entities")
 
@@ -656,6 +660,7 @@ class SongpalEntity(MediaPlayerEntity):
 
     def _group_name(self, slaves: Iterable[str]) -> str:
         """Return a group name listing the leader and its members."""
+        slaves = list(slaves)
         entities = self.hass.data[GROUP_ENTITIES]
         names = [self._friendly_name]
         names.extend(
@@ -663,7 +668,13 @@ class SongpalEntity(MediaPlayerEntity):
             for udn in slaves
             if (member := entities.get(udn)) is not None
         )
-        return " + ".join(names)
+        name = " + ".join(names)
+        if (
+            len(slaves) + 1 > GROUP_NAME_MAX_LISTED
+            or len(name.encode()) > GROUP_NAME_MAX_BYTES
+        ):
+            name = f"{self._friendly_name} + {len(slaves)}"
+        return name.encode()[:GROUP_NAME_MAX_BYTES].decode(errors="ignore")
 
     async def _async_rename_group(self, slaves: list[str]) -> None:
         """Rename the group led by this device after its members changed."""
