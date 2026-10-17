@@ -70,6 +70,11 @@ GROUP_MODE_IDLE = "IDLE"
 GROUP_NAME_MAX_BYTES = 64
 # Larger groups are named after the leader and the number of other members
 GROUP_NAME_MAX_LISTED = 3
+# Codec of the groups created by Sony's app, as stored in the devices' group
+# memory. Groups created with python-songpal's CodecType 0x40 and CodecBitrate 3
+# had dropouts when resuming playback after a pause.
+GROUP_CODEC_TYPE = 48
+GROUP_CODEC_BITRATE = 0
 
 GROUP_ENTITIES: HassKey[dict[str, SongpalEntity]] = HassKey(f"{DOMAIN}_group_entities")
 
@@ -797,7 +802,14 @@ class SongpalEntity(MediaPlayerEntity):
                     slaves += new_udns
                     await self._async_rename_group(slaves)
             else:
-                await group_control.create(self._group_name(udns), udns)
+                await group_control.call(
+                    "X_Start",
+                    GroupMode=GROUP_MODE_GROUP,
+                    GroupName=self._group_name(udns),
+                    SlaveList=",".join(udns),
+                    CodecType=GROUP_CODEC_TYPE,
+                    CodecBitrate=GROUP_CODEC_BITRATE,
+                )
                 slaves = udns
         except UpnpError as ex:
             raise HomeAssistantError(
