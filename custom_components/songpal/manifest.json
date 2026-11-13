@@ -2,8 +2,10 @@
   "domain": "songpal",
   "name": "Sony Songpal",
   "after_dependencies": ["ssdp"],
+  "categories": ["media_entertainment.speakers_audio"],
   "codeowners": ["@SirScythe"],
   "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://github.com/SirScythe/songpal",
   "integration_type": "device",
   "iot_class": "local_push",
@@ -16,5 +18,5 @@
       "st": "urn:schemas-sony-com:service:ScalarWebAPI:1"
     }
   ],
-  "version": "0.3.1"
+  "version": "0.4.0"
 }

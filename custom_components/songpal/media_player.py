@@ -39,24 +39,19 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import (
-    AddConfigEntryEntitiesCallback,
-    AddEntitiesCallback,
-)
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.service_info.ssdp import (
     ATTR_UPNP_FRIENDLY_NAME,
     ATTR_UPNP_UDN,
+    SsdpServiceInfo,
 )
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util.hass_dict import HassKey
+from homeassistant.util.network import is_ip_address
 
 from .const import CONF_ENDPOINT, DOMAIN, ERROR_REQUEST_RETRY, UPNP_ST_SCALARWEBAPI
 
 _LOGGER = logging.getLogger(__name__)
-
-PARAM_NAME = "name"
-PARAM_VALUE = "value"
 
 INITIAL_RETRY_DELAY = 10
 
@@ -70,16 +65,16 @@ GROUP_MODE_IDLE = "IDLE"
 GROUP_NAME_MAX_BYTES = 64
 # Larger groups are named after the leader and the number of other members
 GROUP_NAME_MAX_LISTED = 3
-# Codec of the groups created by Sony's app, as stored in the devices' group
-# memory. Groups created with python-songpal's CodecType 0x40 and CodecBitrate 3
-# had dropouts when resuming playback after a pause.
+# Codec Sony's app uses for groups, as reported by the leader of a group created
+# in the app. Groups created with python-songpal's CodecType 0x40 and
+# CodecBitrate 3 had dropouts when resuming playback after a pause.
 GROUP_CODEC_TYPE = 48
 GROUP_CODEC_BITRATE = 0
 
 GROUP_ENTITIES: HassKey[dict[str, SongpalEntity]] = HassKey(f"{DOMAIN}_group_entities")
 
 
-def _slaves(state: GroupState) -> list[str]:
+def _member_udns(state: GroupState) -> list[str]:
     """Return the UDNs of the group members listed in a leader's state."""
     return [udn.strip() for udn in state.SlaveList.split(",") if udn.strip()]
 
@@ -87,25 +82,15 @@ def _slaves(state: GroupState) -> list[str]:
 def _with_group(
     state: GroupState,
     mode: str = GROUP_MODE_IDLE,
-    master: str | None = "",
-    slaves: Iterable[str] = (),
+    leader_udn: str | None = "",
+    member_udns: Iterable[str] = (),
 ) -> GroupState:
     """Return the state with its group replaced, ungrouped by default."""
     return attr.evolve(
-        state, GroupMode=mode, MasterUUID=master or "", SlaveList=",".join(slaves)
-    )
-
-
-async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
-) -> None:
-    """Set up from legacy configuration file. Obsolete."""
-    _LOGGER.error(
-        "Configuring Songpal through media_player platform is no longer supported."
-        " Convert to songpal platform or UI configuration"
+        state,
+        GroupMode=mode,
+        MasterUUID=leader_udn or "",
+        SlaveList=",".join(member_udns),
     )
 
 
@@ -177,14 +162,24 @@ class SongpalEntity(MediaPlayerEntity):
         self._udn: str | None = None
         self._friendly_name: str = name
         self._group_settling = False
+        self._removed = False
         self._group_prune_lock = asyncio.Lock()
         self._cancel_group_refresh: CALLBACK_TYPE | None = None
 
     @override
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
-        await self.async_activate_websocket()
-        await self._async_update_group_state()
+        entry = await self.async_activate_websocket()
+        # Connecting to the group service can take a while, don't block the setup
+        group_setup = entry.async_create_background_task(
+            self.hass, self._async_update_group_state(), "songpal-group-setup"
+        )
+
+        @callback
+        def _cancel_group_setup() -> None:
+            group_setup.cancel()
+
+        self.async_on_remove(_cancel_group_setup)
         self.async_on_remove(
             async_track_time_interval(
                 self.hass, self._async_poll_group_state, GROUP_SCAN_INTERVAL
@@ -195,6 +190,7 @@ class SongpalEntity(MediaPlayerEntity):
     @override
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
+        self._removed = True
         await self._dev.stop_listen_notifications()
 
     async def _get_sound_modes_info(self):
@@ -224,7 +220,7 @@ class SongpalEntity(MediaPlayerEntity):
 
         return active_sound_mode, sound_modes
 
-    async def async_activate_websocket(self):
+    async def async_activate_websocket(self) -> ConfigEntry:
         """Activate websocket for listening if wanted."""
         _LOGGER.debug("Activating websocket connection")
 
@@ -279,7 +275,7 @@ class SongpalEntity(MediaPlayerEntity):
             # Try to reconnect forever, a successful reconnect will initialize
             # the websocket connection again.
             delay = INITIAL_RETRY_DELAY
-            while not self._attr_available:
+            while not self._attr_available and not self._removed:
                 _LOGGER.debug("Trying to reconnect in %s seconds", delay)
                 await asyncio.sleep(delay)
 
@@ -293,6 +289,8 @@ class SongpalEntity(MediaPlayerEntity):
                     # back from a disconnected state.
                     await self.async_update_ha_state(force_refresh=True)
 
+            if self._removed:
+                return
             entry.async_create_background_task(
                 self.hass,
                 self._dev.listen_notifications(),
@@ -301,6 +299,8 @@ class SongpalEntity(MediaPlayerEntity):
             _LOGGER.warning(
                 "[%s(%s)] Connection reestablished", self.name, self._dev.endpoint
             )
+            # The UPnP location may have changed while the device was gone
+            await self._async_setup_group_control()
 
         self._dev.on_notification(VolumeChange, _volume_changed)
         self._dev.on_notification(ContentChange, _source_changed)
@@ -318,6 +318,7 @@ class SongpalEntity(MediaPlayerEntity):
         entry.async_create_background_task(
             self.hass, self._dev.listen_notifications(), "songpal-listen-notifications"
         )
+        return entry
 
     @property
     @override
@@ -527,28 +528,50 @@ class SongpalEntity(MediaPlayerEntity):
         )
 
     def _get_group_control(self) -> GroupControl:
-        """Return the group control or raise if grouping is not available."""
-        if self._group_control is None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="grouping_not_available",
-                translation_placeholders={"entity_id": self.entity_id},
-            )
+        """Return the group control of a device that supports grouping."""
+        assert self._group_control is not None
         return self._group_control
+
+    async def _async_find_ssdp_info(self) -> SsdpServiceInfo | None:
+        """Return the SSDP discovery info of the device."""
+        infos = [
+            info
+            for info in await ssdp.async_get_discovery_info_by_st(
+                self.hass, UPNP_ST_SCALARWEBAPI
+            )
+            if info.ssdp_location
+        ]
+        endpoint = self._dev.endpoint
+        for info in infos:
+            device_info = info.upnp.get("X_ScalarWebAPI_DeviceInfo") or {}
+            if device_info.get("X_ScalarWebAPI_BaseURL") == endpoint:
+                return info
+
+        # Endpoints entered manually may use a host name instead of the address
+        if host := urlparse(endpoint).hostname:
+            addresses = {host}
+            if not is_ip_address(host):
+                try:
+                    addresses.update(
+                        address[4][0]
+                        for address in await self.hass.loop.getaddrinfo(host, None)
+                    )
+                except OSError as ex:
+                    _LOGGER.debug("Unable to resolve %s: %s", host, ex)
+            for info in infos:
+                if urlparse(info.ssdp_location).hostname in addresses:
+                    return info
+
+        _LOGGER.debug("No SSDP discovery info found for %s", endpoint)
+        return None
 
     async def _async_setup_group_control(self) -> None:
         """Connect to the UPnP group service of the device, if it was discovered."""
         if "ssdp" not in self.hass.config.components:
             return
-
-        host = urlparse(self._dev.endpoint).hostname
-        for info in await ssdp.async_get_discovery_info_by_st(
-            self.hass, UPNP_ST_SCALARWEBAPI
-        ):
-            if info.ssdp_location and urlparse(info.ssdp_location).hostname == host:
-                break
-        else:
+        if (info := await self._async_find_ssdp_info()) is None:
             return
+        assert info.ssdp_location is not None
 
         group_control = GroupControl(info.ssdp_location)
         try:
@@ -558,6 +581,8 @@ class SongpalEntity(MediaPlayerEntity):
         except (UpnpError, KeyError, TimeoutError) as ex:
             _LOGGER.debug("Unable to connect to the group service: %s", ex)
             return
+        if self._removed:
+            return
 
         udn = info.upnp[ATTR_UPNP_UDN]
         self._group_control = group_control
@@ -566,13 +591,16 @@ class SongpalEntity(MediaPlayerEntity):
         self._attr_supported_features |= MediaPlayerEntityFeature.GROUPING
 
         entities = self.hass.data.setdefault(GROUP_ENTITIES, {})
-        entities[udn] = self
+        if entities.get(udn) is not self:
+            entities[udn] = self
 
-        @callback
-        def _unregister() -> None:
-            entities.pop(udn, None)
+            @callback
+            def _unregister() -> None:
+                if entities.get(udn) is self:
+                    del entities[udn]
 
-        self.async_on_remove(_unregister)
+            self.async_on_remove(_unregister)
+        self.async_write_ha_state()
 
     async def _async_poll_group_state(self, _now: Any) -> None:
         """Poll the group state, unless a group change is still settling."""
@@ -649,7 +677,7 @@ class SongpalEntity(MediaPlayerEntity):
         members = [self.entity_id]
         members.extend(
             member.entity_id
-            for udn in _slaves(self._group_state)
+            for udn in _member_udns(self._group_state)
             if (member := entities.get(udn)) is not None
         )
         return members
@@ -705,7 +733,7 @@ class SongpalEntity(MediaPlayerEntity):
                     await self.async_unjoin_player()
                     return
                 entities = self.hass.data[GROUP_ENTITIES]
-                for udn in _slaves(self._group_state):
+                for udn in _member_udns(self._group_state):
                     member = entities.get(udn)
                     if member is not None and member._is_off:  # noqa: SLF001
                         _LOGGER.info(
@@ -727,38 +755,42 @@ class SongpalEntity(MediaPlayerEntity):
             expected[member] = _with_group(member._group_state)
         if self._group_state is not None:
             # The leader dissolves the group when its last member leaves
-            remaining = [udn for udn in _slaves(self._group_state) if udn != member.udn]
+            remaining = [
+                udn for udn in _member_udns(self._group_state) if udn != member.udn
+            ]
             if remaining:
                 await self._async_rename_group(remaining)
             expected[self] = _with_group(
                 self._group_state,
                 GROUP_MODE_GROUP if remaining else GROUP_MODE_IDLE,
-                slaves=remaining,
+                member_udns=remaining,
             )
         self._async_set_expected_group_states(expected)
 
-    def _group_name(self, slaves: Iterable[str]) -> str:
+    def _group_name(self, member_udns: Iterable[str]) -> str:
         """Return a group name listing the leader and its members."""
-        slaves = list(slaves)
+        member_udns = list(member_udns)
         entities = self.hass.data[GROUP_ENTITIES]
         names = [self._friendly_name]
         names.extend(
             member._friendly_name  # noqa: SLF001
-            for udn in slaves
+            for udn in member_udns
             if (member := entities.get(udn)) is not None
         )
         name = " + ".join(names)
         if (
-            len(slaves) + 1 > GROUP_NAME_MAX_LISTED
+            len(member_udns) + 1 > GROUP_NAME_MAX_LISTED
             or len(name.encode()) > GROUP_NAME_MAX_BYTES
         ):
-            name = f"{self._friendly_name} + {len(slaves)}"
+            name = f"{self._friendly_name} + {len(member_udns)}"
         return name.encode()[:GROUP_NAME_MAX_BYTES].decode(errors="ignore")
 
-    async def _async_rename_group(self, slaves: list[str]) -> None:
+    async def _async_rename_group(self, member_udns: list[str]) -> None:
         """Rename the group led by this device after its members changed."""
         try:
-            await self._get_group_control().set_group_name(self._group_name(slaves))
+            await self._get_group_control().set_group_name(
+                self._group_name(member_udns)
+            )
         except UpnpError as ex:
             # The members changed already, a stale name is no reason to fail
             _LOGGER.warning("Unable to rename the group of %s: %s", self.entity_id, ex)
@@ -796,11 +828,11 @@ class SongpalEntity(MediaPlayerEntity):
                     translation_placeholders={"entity_id": self.entity_id},
                 )
             if state.GroupMode == GROUP_MODE_GROUP:
-                slaves = _slaves(state)
-                if new_udns := [udn for udn in udns if udn not in slaves]:
+                member_udns = _member_udns(state)
+                if new_udns := [udn for udn in udns if udn not in member_udns]:
                     await group_control.add(",".join(new_udns))
-                    slaves += new_udns
-                    await self._async_rename_group(slaves)
+                    member_udns += new_udns
+                    await self._async_rename_group(member_udns)
             else:
                 await group_control.call(
                     "X_Start",
@@ -810,7 +842,7 @@ class SongpalEntity(MediaPlayerEntity):
                     CodecType=GROUP_CODEC_TYPE,
                     CodecBitrate=GROUP_CODEC_BITRATE,
                 )
-                slaves = udns
+                member_udns = udns
         except UpnpError as ex:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -821,13 +853,13 @@ class SongpalEntity(MediaPlayerEntity):
                 },
             ) from ex
 
-        expected = {self: _with_group(state, GROUP_MODE_GROUP, slaves=slaves)}
+        expected = {self: _with_group(state, GROUP_MODE_GROUP, member_udns=member_udns)}
         for member in members:
             if member._group_state is not None:  # noqa: SLF001
                 expected[member] = _with_group(
                     member._group_state,  # noqa: SLF001
                     GROUP_MODE_GROUP,
-                    master=self._udn,
+                    leader_udn=self._udn,
                 )
         self._async_set_expected_group_states(expected)
 
@@ -860,7 +892,7 @@ class SongpalEntity(MediaPlayerEntity):
 
         expected = {self: _with_group(state)}
         if not state.MasterUUID:
-            for udn in _slaves(state):
+            for udn in _member_udns(state):
                 member = entities.get(udn)
                 if member is not None and member._group_state is not None:  # noqa: SLF001
                     expected[member] = _with_group(member._group_state)  # noqa: SLF001
